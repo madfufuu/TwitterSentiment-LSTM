@@ -1,0 +1,368 @@
+'''train.py
+
+CS 6375.003 Final Project: train.py
+Authors: Usuma Thet, Merissa Fulfer, Rishi Dandu, Yuncheng Gao
+
+    python train.py
+
+'''
+import nltk
+from nltk.corpus import stopwords
+from  nltk.stem import SnowballStemmer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from keras.preprocessing.text import Tokenizer
+from keras.preprocessing.sequence import pad_sequences
+from keras.models import Sequential
+from keras.layers import Activation, Dense, Dropout, Embedding, Flatten, Conv1D, MaxPooling1D, LSTM
+from keras import utils
+from keras.callbacks import ReduceLROnPlateau, EarlyStopping
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+import gensim
+import re
+import numpy as np
+import sys
+import os
+from collections import Counter
+import logging
+import time
+import pickle
+import itertools
+
+def main(argv):
+    if len(argv) != 1:
+        raise Exception("Incorrect number of arguments")
+    DATASET_NAME = argv[0]
+    
+    DATASET_COLUMNS = ["target", "ids", "date", "flag", "user", "text"]
+    DATASET_ENCODING = "ISO-8859-1"
+    TRAIN_SIZE = 0.8
+
+    TEXT_CLEANING_RE = "@\S+|https?:\S+|http?:\S|[^A-Za-z0-9]+"
+
+    W2V_SIZE = 300
+    W2V_WINDOW = 7
+    W2V_EPOCH = 32
+    W2V_MIN_COUNT = 10
+    SEQUENCE_LENGTH = 20
+    EPOCHS = 32
+    BATCH = 1024
+    POSITIVE = "POSITIVE"
+    NEGATIVE = "NEGATIVE"
+    NEUTRAL = "NEUTRAL"
+
+    df = pd.read_csv(DATASET_NAME, encoding = DATASET_ENCODING , names= DATASET_COLUMNS)
+
+    decode_map = {0: "NEGATIVE", 2: "NEUTRAL", 4: "POSITIVE"}
+    def decode_sentiment(label):
+        return decode_map[int(label)]
+
+    df.target = df.target.apply(lambda x: decode_sentiment(x))
+
+    stop_words = stopwords.words("english")
+    stemmer = SnowballStemmer("english")
+
+    def preprocess(text, stem=False):
+        text = re.sub(TEXT_CLEANING_RE, ' ', str(text).lower()).strip()
+        tokens = []
+        for token in text.split():
+            if token not in stop_words:
+                if stem:
+                    tokens.append(stemmer.stem(token))
+                else:
+                    tokens.append(token)
+        # append the tokens with a space between each other
+        return " ".join(tokens)
+
+    df.text = df.text.apply(lambda x: preprocess(x))
+
+    TRAININGSET, TESTINGSET = train_test_split(df, test_size=1-TRAIN_SIZE, random_state=1)
+    print("TRAIN size:", len(TRAININGSET))
+    print("TEST size:", len(TESTINGSET))
+
+    # Preprocessing
+    documents = [_text.split() for _text in TRAININGSET.text] 
+    w2v_model = gensim.models.word2vec.Word2Vec(size=W2V_SIZE, 
+                                                window=W2V_WINDOW, 
+                                                min_count=W2V_MIN_COUNT, 
+                                                workers=8)
+
+    w2v_model.build_vocab(documents)
+
+    words = w2v_model.wv.vocab.keys()
+    vocab_size = len(words)
+
+    w2v_model.train(documents, total_examples=len(documents), epochs=W2V_EPOCH)
+
+    tokenizer = Tokenizer()
+    tokenizer.fit_on_texts(TRAININGSET.text)
+
+    vocab_size = len(tokenizer.word_index) + 1
+
+    x_train = pad_sequences(tokenizer.texts_to_sequences(TRAININGSET.text), maxlen=SEQUENCE_LENGTH)
+    x_test = pad_sequences(tokenizer.texts_to_sequences(TESTINGSET.text), maxlen=SEQUENCE_LENGTH)
+
+    labels = TRAININGSET.target.unique().tolist()
+    labels.append(NEUTRAL)
+
+    encoder = LabelEncoder()
+    encoder.fit(TRAININGSET.target.tolist())
+
+    y_train = encoder.transform(TRAININGSET.target.tolist())
+    y_test = encoder.transform(TESTINGSET.target.tolist())
+
+    y_train = y_train.reshape(-1,1)
+    y_test = y_test.reshape(-1,1)
+
+    embedding_matrix = np.zeros((vocab_size, W2V_SIZE))
+    for word, i in tokenizer.word_index.items():
+        if word in w2v_model.wv:
+            embedding_matrix[i] = w2v_model.wv[word]
+        print(embedding_matrix.shape)
+
+    embedding_layer = Embedding(vocab_size, W2V_SIZE, weights=[embedding_matrix], input_length=SEQUENCE_LENGTH, trainable=False)
+
+    # Creating the model
+    model = Sequential()
+    # Added the embedding layer
+    model.add(embedding_layer)
+    # One drop layer to reduce overfitting
+    model.add(Dropout(0.6))
+    # 100 LSTM Layer
+    model.add(LSTM(200, dropout=0.1, recurrent_dropout=0.2))
+    # Final layer for output
+    model.add(Dense(1, activation='sigmoid'))
+    model.summary()
+    model.compile(loss='binary_crossentropy', optimizer="adam", metrics=['accuracy'])
+    callbackFunction = [ReduceLROnPlateau(monitor='val_loss', patience=5, cooldown=0), EarlyStopping(monitor='val_acc', min_delta=1e-4, patience=5)]
+    print("Model compiled")
+    his = model.fit(x_train, y_train, batch_size=BATCH, epochs=EPOCHS, validation_split=0.1, verbose=1, callbacks=callbackFunction)
+    print("Model finished training")
+    score = model.evaluate(x_test, y_test, batch_size=BATCH)
+    print("Accuracy:",score[1])
+    print("Loss:",score[0])
+
+    model.save("model.h5")
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+    '''evaluate.py
+
+CS 6375.003 Final Project: evaluate.py
+Authors: Usuma Thet, Merissa Fulfer, Rishi Dandu, Yuncheng Gao
+
+    python evaluate.py testSet.csv x_test.csv model.h5
+
+    testSet.csv is the testing dataset
+    x_test.csv contains all of the parameters for a single sentence
+    model.h5 is the model for which will be evaluated for.
+
+'''
+
+from keras.models import load_model
+import sys
+import time
+from keras.preprocessing.sequence import pad_sequences
+from keras.preprocessing.text import Tokenizer
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+import nltk
+from nltk.corpus import stopwords
+import pandas as pd
+from numpy import loadtxt
+
+#nltk.download('stopwords')
+
+POSITIVE = "POSITIVE"
+NEGATIVE = "NEGATIVE"
+NEUTRAL = "NEUTRAL"
+threshold = (0.3, 0.7)
+tokenizer = Tokenizer()
+
+def main(argv):
+    
+    # Get filenames from arguments
+    if len(argv) != 3:
+        raise Exception("Incorrect number of arguments") 
+    test_set_name = argv[0]
+    x_test_name = argv[1]
+    model_name = argv[2]
+    SEQUENCE_LENGTH = int(model_name[:3])
+    print(SEQUENCE_LENGTH)
+    x_test = loadtxt(x_test_name, delimiter=',')
+    test_set = pd.read_csv(test_set_name)
+    model = load_model(model_name)
+    print(model)
+    
+    print("Check1")
+
+
+    def classification(score, neutral=True):
+        if neutral:        
+            label = NEUTRAL
+            if score <= threshold[0]:
+                label = NEGATIVE
+            elif score >= threshold[1]:
+                label = POSITIVE
+
+            return label
+        else:
+            return NEGATIVE if score < 0.5 else POSITIVE
+
+
+    def predict(text, neutral=True):
+        start = time.time()
+        x_test = pad_sequences(tokenizer.texts_to_sequences([text]), maxlen=SEQUENCE_LENGTH)
+        score = model.predict([x_test])[0]
+        label = classification(score, neutral=neutral)
+
+        return {"label": label, "score": float(score),
+        "elapsed_time": time.time()-start}
+           
+    #print(predict("this is awesome good! great haha nice"))
+    
+    predictionY = []
+    testY = list(test_set.target)
+    scores = model.predict(x_test, verbose=1, batch_size=8000)
+
+    # Doing predictions without considering neutrals
+    predictionY = [classification(score, neutral=False) for score in scores]
+
+    #print("Done")
+
+    print(classification_report(testY, predictionY))
+    print(accuracy_score(testY, predictionY))
+    print("Evaluation done!")
+  
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
+    '''splitdata.py
+
+CS 6375.003 Final Project: splitdata.py
+Authors: Usuma Thet, Merissa Fulfer, Rishi Dandu, Yuncheng Gao
+
+    python splitdata.py training_size sequence_length dataset.csv
+
+    training_size should be an integer specifying the training size of the model
+    sequence_length should be the hyperparameter used for training
+    dataset.csv is the full dataset
+
+'''
+
+import pandas as pd
+import matplotlib.pyplot as plt
+from keras.preprocessing.sequence import pad_sequences
+from keras.models import Sequential
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from keras.preprocessing.text import Tokenizer
+from keras import utils
+import nltk
+from nltk.corpus import stopwords
+from  nltk.stem import SnowballStemmer
+from numpy import savetxt
+import gensim
+import re
+import numpy as np
+import os
+import logging
+import time
+import pickle
+import itertools
+import sys
+
+nltk.download('stopwords')
+# Get filenames from arguments
+def main(argv):
+    if len(argv) != 3:
+        raise Exception("Incorrect number of arguments")
+    TRAIN_SIZE = float(argv[0])
+    SEQUENCE_LENGTH = int(argv[1])
+    DATASET_NAME = argv[2]
+    
+    DATASET_COLUMNS = ["target", "ids", "date", "flag", "user", "text"]
+    DATASET_ENCODING = "ISO-8859-1"
+
+    # Preprocessing of tweets
+    # Removes all @ signs and urls
+    PREPROCESSING_RE = "@\S+|https?:\S+|http?:\S|[^A-Za-z0-9]+"
+
+    W2V_SIZE = 300
+    W2V_WINDOW = 7
+    W2V_EPOCH = 32
+    W2V_MIN_COUNT = 10
+
+    POSITIVE = "POSITIVE"
+    NEGATIVE = "NEGATIVE"
+    NEUTRAL = "NEUTRAL"
+
+    df = pd.read_csv(DATASET_NAME, encoding =DATASET_ENCODING , names=DATASET_COLUMNS)
+
+    labels = {0: "NEGATIVE", 2: "NEUTRAL", 4: "POSITIVE"}
+
+    def decode(label):
+        return labels[int(label)]
+
+    df.target = df.target.apply(lambda x: decode(x))
+
+    stop_words = stopwords.words("english")
+    stemmer = SnowballStemmer("english")
+
+    def preprocess(text, stem=False):
+        text = re.sub(PREPROCESSING_RE, ' ', str(text).lower())
+        text = text.strip()
+        tokens = []
+        for token in text.split():
+            if token not in stop_words:
+                if stem:
+                    tokens.append(stemmer.stem(token))
+                else:
+                    tokens.append(token)
+                    
+        return " ".join(tokens)
+
+    df.text = df.text.apply(lambda x: preprocess(x))
+
+    df_train, df_test = train_test_split(df, test_size=1-TRAIN_SIZE, random_state=42)
+    print("Training size:", len(df_train))
+    print("Testing size:", len(df_test))
+
+    documents = [_text.split() for _text in df_train.text] 
+
+    wordToVecModel = gensim.models.word2vec.Word2Vec(size=W2V_SIZE, window=W2V_WINDOW, min_count=W2V_MIN_COUNT, workers=8)
+
+    wordToVecModel.build_vocab(documents)
+
+    words = wordToVecModel.wv.vocab.keys()
+    vocab_size = len(words)
+
+    wordToVecModel.train(documents, total_examples=len(documents), epochs=W2V_EPOCH)
+
+    tokenizer = Tokenizer()
+    tokenizer.fit_on_texts(df_train.text)
+
+    vocab_size = len(tokenizer.word_index) + 1
+
+    x_train = pad_sequences(tokenizer.texts_to_sequences(df_train.text), maxlen=SEQUENCE_LENGTH)
+    x_test = pad_sequences(tokenizer.texts_to_sequences(df_test.text), maxlen=SEQUENCE_LENGTH)
+
+    labels = df_train.target.unique().tolist()
+    labels.append(NEUTRAL)
+
+    encoder = LabelEncoder()
+    encoder.fit(df_train.target.tolist())
+
+    y_train = encoder.transform(df_train.target.tolist())
+    y_test = encoder.transform(df_test.target.tolist())
+
+    y_train = y_train.reshape(-1,1)
+    y_test = y_test.reshape(-1,1)
+
+    df_test.to_csv("testSet.csv")
+    df_train.to_csv("trainSet.csv")
+    savetxt('x_test.csv', x_test, delimiter=',')
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
